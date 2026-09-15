@@ -1,0 +1,220 @@
+// bottleneck.slim
+// Neutral bottleneck-and-recovery model. Written for SLiM 5 (haplosome API).
+//
+// Replaces every simulation chunk of the old slimr SLiM.Rmd. The chunks
+// differed only in which parameters they varied and which statistics they
+// logged, so they collapse into one parameterised script.
+//
+// Example:
+//   slim -s 1 -d BOTL_SIZE=50 -d BOTL_LEN=100 -d "OUT='run001.csv'" bottleneck.slim
+//
+// Every constant in the block below can be overridden with -d.
+
+initialize() {
+	// ---- model parameters -------------------------------------------------
+	if (!exists("MU"))        defineConstant("MU", 1e-8);          // per-site mutation rate
+	if (!exists("RHO"))       defineConstant("RHO", 1e-8);         // per-site recombination rate
+	if (!exists("L"))         defineConstant("L", 100000000);      // chromosome length (bp)
+	if (!exists("N0"))        defineConstant("N0", 500);           // size before and after
+	if (!exists("BOTL_SIZE")) defineConstant("BOTL_SIZE", 50);     // size during bottleneck
+	if (!exists("BOTL_LEN"))  defineConstant("BOTL_LEN", 100);     // bottleneck duration (ticks)
+
+	// ---- timing and output ------------------------------------------------
+	if (!exists("BURNIN"))    defineConstant("BURNIN", 10000);     // ticks before bottleneck
+	if (!exists("PRE_LOG"))   defineConstant("PRE_LOG", 2000);     // ticks of pre-bottleneck logging
+	if (!exists("POST"))      defineConstant("POST", 5000);        // ticks of recovery to follow
+	if (!exists("LOG_EVERY"))    defineConstant("LOG_EVERY", 10);  // logging period outside the dense window
+	if (!exists("DENSE_BEFORE")) defineConstant("DENSE_BEFORE", 1);   // ticks of per-generation logging before the crash
+	if (!exists("DENSE_AFTER"))  defineConstant("DENSE_AFTER", 100);  // ... and after the recovery
+	if (!exists("NUM_BINS"))  defineConstant("NUM_BINS", 10);      // coarse site frequency spectrum bins, spanning (0, 1]
+	if (!exists("FINE_N"))     defineConstant("FINE_N", 10);       // fine spectrum bins, spanning (0, FINE_N * FINE_WIDTH]
+	if (!exists("FINE_WIDTH")) defineConstant("FINE_WIDTH", 0.01); // 10 * 0.01 = 0.1, i.e. a disaggregation of coarse bin 1
+	if (!exists("OBS_HET"))   defineConstant("OBS_HET", F);        // also log observed het (slow)
+	if (!exists("OUT"))       defineConstant("OUT", "diversity.csv");
+
+	// ---- derived schedule -------------------------------------------------
+	defineConstant("LOG_START", BURNIN - PRE_LOG);
+	defineConstant("BOTL_END", BURNIN + BOTL_LEN);
+	defineConstant("END", BOTL_END + POST);
+
+	// Per-generation logging spans the bottleneck plus a margin either side:
+	// DENSE_BEFORE = 1 captures the last pre-crash generation (9999), and
+	// DENSE_AFTER = 100 covers the demographic recovery at full resolution.
+	defineConstant("DENSE_START", BURNIN - DENSE_BEFORE);
+	defineConstant("DENSE_END", BOTL_END + DENSE_AFTER);
+
+	// ---- spectrum cache ---------------------------------------------------
+	defineGlobal("SPECTRUM_TICK", -1);
+	defineGlobal("SPECTRUM_BINS", integer(NUM_BINS));
+	defineGlobal("SPECTRUM_FINE_BINS", integer(FINE_N));
+	defineGlobal("SPECTRUM_SEG", 0);
+	defineGlobal("SPECTRUM_SINGLETONS", 0);
+
+	initializeMutationRate(MU);
+	initializeMutationType("m1", 0.5, "f", 0.0);       // neutral
+	initializeGenomicElementType("g1", m1, 1.0);
+	initializeGenomicElement(g1, 0, asInteger(L) - 1);
+	initializeRecombinationRate(RHO);
+}
+
+// Derived site frequency spectrum, at two resolutions from the same pass over
+// the population's mutations: NUM_BINS coarse bins spanning the full
+// frequency range (0, 1], and FINE_N fine bins of width FINE_WIDTH spanning
+// (0, FINE_N * FINE_WIDTH] -- a disaggregation of just the coarse spectrum's
+// bin 1, since that is the bin dominated by rare variants and so the one most
+// often worth a closer look. What a fine bin represents in allele copies
+// depends on sample size, since a bin of width FINE_WIDTH spans
+// FINE_WIDTH * n copies: at n = 100 (a BOTL_SIZE = 50 bottleneck, with the
+// default FINE_WIDTH = 0.01) that is exactly 1 copy per bin, so each bin is a
+// single copy-number class; at n = 1000 (N0 = 500) it is 10 copies per bin.
+// Segregating-site and singleton counts fall out of the same pass. Folded in
+// from the old SFS.slim, which ran a separate simulation -- computing it here
+// means the spectrum and the diversity statistics describe the same
+// replicates and can be put side by side.
+//
+// The LogFile asks for two dozen-odd columns per row, all derived from this
+// one calculation, so it is cached per tick.
+function (void)refreshSpectrum(void) {
+	if (SPECTRUM_TICK == community.tick)
+		return;
+
+	n = p1.haplosomes.size();
+
+	// Exact derived allele counts. The old version went via
+	// round(frequency * individualCount), which both loses resolution and is
+	// out by a factor of two (individualCount is N, but a frequency is a
+	// fraction of the 2N haplosomes).
+	k = p1.haplosomes.mutationCountsInHaplosomes(NULL);
+	k = k[(k > 0) & (k < n)];               // segregating sites only
+	p = k / n;
+
+	// EPS guards ceil() against floating-point boundary overshoot. Neither
+	// 0.01 nor most fractions k/n are exactly representable in binary
+	// floating point, so a ratio that is mathematically exactly an integer
+	// (e.g. k=7, n=100, width=0.01, so p/width = 7 exactly on paper) can come
+	// out as 7.000000000000001 in IEEE 754 double arithmetic -- verified
+	// directly: 0.07/0.01 in double precision is not 7.0. ceil() then rounds
+	// that up to 8, silently moving every site with exactly that count into
+	// the next bin over. This is deterministic, not sampling noise: it
+	// reproduces in every replicate, at every generation where n makes the
+	// ratio land on an integer, and was caught by every single BOTL_SIZE = 50
+	// replicate showing FineBin_7 identically zero (with FineBin_8
+	// correspondingly inflated) throughout the bottleneck, where
+	// FINE_WIDTH * n = 1 puts every one of the ten fine bins exactly on such
+	// a boundary. 1e-9 is far above the ~1e-15 scale of the floating-point
+	// error and far below the minimum gap between adjacent integer bins (1),
+	// so it cannot misclassify anything that wasn't already borderline.
+	EPS = 1e-9;
+
+	// coarse spectrum: NUM_BINS equal-width bins across the full range
+	coarseBin = asInteger(ceil(p * NUM_BINS - EPS));
+	coarseBin[coarseBin < 1] = 1;
+	coarseBin[coarseBin > NUM_BINS] = NUM_BINS;
+
+	coarseCounts = integer(NUM_BINS);
+	for (i in 1:NUM_BINS)
+		coarseCounts[i - 1] = sum(coarseBin == i);
+
+	// fine spectrum: FINE_N equal-width bins across (0, FINE_N * FINE_WIDTH]
+	fineMax = FINE_N * FINE_WIDTH;
+	pFine = p[p <= fineMax];
+
+	fineBinIdx = asInteger(ceil(pFine / FINE_WIDTH - EPS));
+	fineBinIdx[fineBinIdx < 1] = 1;
+	fineBinIdx[fineBinIdx > FINE_N] = FINE_N;
+
+	fineCounts = integer(FINE_N);
+	for (i in 1:FINE_N)
+		fineCounts[i - 1] = sum(fineBinIdx == i);
+
+	defineGlobal("SPECTRUM_BINS", coarseCounts);
+	defineGlobal("SPECTRUM_FINE_BINS", fineCounts);
+	defineGlobal("SPECTRUM_SEG", size(k));
+	defineGlobal("SPECTRUM_SINGLETONS", sum(k == 1));
+	defineGlobal("SPECTRUM_TICK", community.tick);
+}
+
+function (integer$)sfsBin(integer$ i) {
+	refreshSpectrum();
+	return SPECTRUM_BINS[i - 1];
+}
+
+function (integer$)fineBin(integer$ i) {
+	refreshSpectrum();
+	return SPECTRUM_FINE_BINS[i - 1];
+}
+
+// Number of segregating sites. Replaces the old chunk that wrote a VCF every
+// 10 ticks and counted loci with slim_extract_genlight() -- same quantity,
+// without the round-trip through disk and adegenet.
+function (integer$)segSites(void) {
+	refreshSpectrum();
+	return SPECTRUM_SEG;
+}
+
+// Bin 1 spans frequencies 0 to 1/NUM_BINS, which at N = 500 lumps singletons
+// in with everything up to 10% frequency. Since singletons are what drive
+// Watterson's theta, log them separately.
+function (integer$)singletons(void) {
+	refreshSpectrum();
+	return SPECTRUM_SINGLETONS;
+}
+
+// Mean *observed* heterozygosity, to compare against the expected
+// (Hardy-Weinberg) value from calcHeterozygosity(). This is one
+// calcPairHeterozygosity() call per individual per logged tick, so it is off
+// by default; enable with -d OBS_HET=T.
+function (float$)observedHet(void) {
+	total = 0.0;
+	for (ind in p1.individuals)
+		total = total + calcPairHeterozygosity(ind.haplosomes[0], ind.haplosomes[1]);
+	return total / p1.individualCount;
+}
+
+1 early() {
+	sim.addSubpop("p1", asInteger(N0));
+
+	// LogFile replaces slimr's r_output(). Columns are Eidos expressions
+	// evaluated each time logRow() is called.
+	log = community.createLogFile(OUT);
+	log.addTick();
+	log.addCustomColumn("N", "p1.individualCount;");
+	log.addCustomColumn("het", "calcHeterozygosity(p1.haplosomes);");
+	log.addCustomColumn("pi", "calcPi(p1.haplosomes);");
+	log.addCustomColumn("wtheta", "calcWattersonsTheta(p1.haplosomes);");
+	log.addCustomColumn("tajimaD", "calcTajimasD(p1.haplosomes);");
+	log.addCustomColumn("segsites", "segSites();");
+	log.addCustomColumn("singletons", "singletons();");
+	for (b in 1:NUM_BINS)
+		log.addCustomColumn("SFS_bin_" + b, "sfsBin(" + b + ");");
+	for (b in 1:FINE_N)
+		log.addCustomColumn("FineBin_" + b, "fineBin(" + b + ");");
+	if (OBS_HET)
+		log.addCustomColumn("obs_het", "observedHet();");
+
+	defineConstant("LOG", log);
+}
+
+// Log every tick across the dense window, every LOG_EVERY ticks either side.
+LOG_START:END late() {
+	t = community.tick;
+
+	if ((t >= DENSE_START) & (t <= DENSE_END))
+		LOG.logRow();
+	else if (t % LOG_EVERY == 0)
+		LOG.logRow();
+}
+
+// setSubpopulationSize() in late() takes effect for the next tick's
+// reproduction, so the row logged at BURNIN is still the pre-bottleneck state.
+BURNIN late() {
+	p1.setSubpopulationSize(asInteger(BOTL_SIZE));
+}
+
+BOTL_END late() {
+	p1.setSubpopulationSize(asInteger(N0));
+}
+
+END late() {
+	sim.simulationFinished();
+}

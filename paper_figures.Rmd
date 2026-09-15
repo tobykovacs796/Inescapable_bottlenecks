@@ -1,0 +1,712 @@
+---
+title: "Simulation and figure code"
+output: html_document
+---
+
+This script reproduces every figure in the manuscript (Figures 2-4) from
+scratch: it runs the SLiM bottleneck-recovery model, reads the koala
+allele-frequency/VEP tables, and builds each figure.
+
+**To run this file**, put it in a folder together with:
+
+- `bottleneck.slim` -- the SLiM model (see below)
+- a `data/` subfolder containing the twelve raw tables Figure 4 needs (listed,
+  with their source, in that section below). These are not included in this
+  repository -- they were made available previously by Ahrens et al. (2026).
+
+and make sure SLiM >= 5.0 is installed and on your `PATH` (or set the
+`SLIMR_PATH` environment variable to its location). `calcPi()` is broken in
+SLiM 4.3 and earlier, so the `slim-bin` chunk below checks the version and
+stops if it's too old.
+
+R packages required: `dplyr`, `tidyr`, `readr`, `purrr`, `furrr`, `ggplot2`,
+`scales`, `rlang`, `patchwork`, `ggh4x`.
+
+Knitting from a clean checkout will run all of the bottleneck simulations
+(a few minutes, in parallel across 5 workers) and rebuild every figure as a
+PDF alongside this file.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+
+```{r libs}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(purrr)
+library(furrr)
+library(ggplot2)
+library(scales)
+library(rlang)
+library(patchwork)
+library(ggh4x)
+```
+
+## Paths
+
+```{r paths}
+PROJ_DIR    <- normalizePath(".")
+FIG_DIR     <- PROJ_DIR
+RUN_DIR     <- file.path(PROJ_DIR, "runs")
+SLIM_SCRIPT <- file.path(PROJ_DIR, "bottleneck.slim")
+
+dir.create(RUN_DIR, showWarnings = FALSE, recursive = TRUE)
+stopifnot(file.exists(SLIM_SCRIPT))
+
+save_fig <- function(name, plot, width = 8, height = 6) {
+  ggsave(file.path(FIG_DIR, name), plot, width = width, height = height)
+}
+```
+
+```{r slim-bin}
+slim_bin <- Sys.getenv("SLIMR_PATH", unset = "slim")
+
+slim_version <- function(bin = slim_bin) {
+  out <- system2(bin, "-v", stdout = TRUE, stderr = TRUE)
+  as.numeric_version(sub(".*SLiM version ([0-9.]+).*", "\\1", out[1]))
+}
+
+v <- slim_version()
+if (v < "5.0") {
+  stop("Need SLiM >= 5.0 (found ", v, "). calcPi() is broken before 5.0.")
+}
+v
+```
+
+## Running the model
+
+`run_one()` shells out to SLiM once and reads back the CSV it writes via
+`LogFile`. `sweep()` expands a parameter grid across replicates and runs them
+in parallel with `furrr`, tagging every row with the parameters that produced
+it. `system2()` quotes the command but not its arguments, so anything that
+might contain spaces or shell metacharacters (the output path, in particular)
+is wrapped in `shQuote()` here.
+
+```{r runners}
+run_one <- function(seed, out, script = SLIM_SCRIPT, ...) {
+  pars <- list(...)
+
+  defs <- unlist(lapply(names(pars), function(nm) {
+    c("-d", sprintf("%s=%s", nm, format(pars[[nm]], scientific = FALSE)))
+  }))
+
+  args <- c(
+    "-s", seed,
+    defs,
+    "-d", shQuote(sprintf('OUT="%s"', out)),
+    shQuote(script)
+  )
+
+  log <- system2(slim_bin, args, stdout = TRUE, stderr = TRUE)
+  status <- attr(log, "status")
+  if (!is.null(status) && status != 0) {
+    stop("SLiM failed (exit ", status, ") for seed ", seed, ":\n",
+         paste(tail(log, 20), collapse = "\n"), call. = FALSE)
+  }
+
+  read_csv(out, show_col_types = FALSE)
+}
+
+sweep <- function(..., reps = 10, dir) {
+  dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+
+  grid <- expand_grid(..., rep = seq_len(reps))
+  grid$seed <- seq_len(nrow(grid))
+
+  rows <- future_pmap(grid, function(rep, seed, ...) {
+    pars <- list(...)
+    out <- file.path(dir, sprintf("run_%05d.csv", seed))
+
+    do.call(run_one, c(list(seed = seed, out = out), pars)) |>
+      mutate(rep = rep, !!!pars)
+  }, .options = furrr_options(seed = TRUE))
+
+  bind_rows(rows)
+}
+
+plan(multisession, workers = 5)
+```
+
+## Data
+
+Figures 2 and 3's bottom/right panels only need the `BOTL_SIZE` sweep
+(bottleneck length 100, mutation rate 1e-8), so that's the only sweep run
+here.
+
+```{r sweeps, cache = TRUE, cache.extra = tools::md5sum(SLIM_SCRIPT)}
+size_sweep <- sweep(
+  BOTL_SIZE = c(200, 50, 10), BOTL_LEN = 100, MU = 1e-8,
+  reps = 20, dir = file.path(RUN_DIR, "size")
+)
+```
+
+## Figure 2: combined diversity recovery and site frequency spectrum
+
+Heterozygosity and segregating sites (each scaled by its own pre-bottleneck
+mean) stacked over the site frequency spectrum at five key generations, for
+the N = 50, 100-generation bottleneck.
+
+```{r het-segsites-tidy}
+PANEL_LABELS <- c(het = "Heterozygosity", segsites = "Segregating sites")
+
+panel_long <- size_sweep |>
+  filter(BOTL_SIZE == 50) |>
+  select(tick, rep, all_of(names(PANEL_LABELS))) |>
+  pivot_longer(all_of(names(PANEL_LABELS)),
+               names_to = "stat", values_to = "value") |>
+  mutate(stat = factor(stat, names(PANEL_LABELS), PANEL_LABELS))
+
+panel_base <- panel_long |>
+  filter(tick <= 10000) |>
+  group_by(stat) |>
+  summarise(base = mean(value), .groups = "drop")
+
+panel_summary <- panel_long |>
+  group_by(tick, stat) |>
+  summarise(m = mean(value), se = sd(value) / sqrt(n()), .groups = "drop") |>
+  left_join(panel_base, by = "stat") |>
+  mutate(rel = m / base,
+         lo  = (m - 1.96 * se) / base,
+         hi  = (m + 1.96 * se) / base) |>
+  filter(tick >= 9900, tick <= 10300)
+```
+
+```{r sfs-tidy}
+sfs_long <- size_sweep |>
+  filter(BOTL_SIZE == 50) |>
+  select(cycle = tick, rep, Num_seg_sites = segsites, starts_with("SFS_bin_")) |>
+  pivot_longer(starts_with("SFS_bin_"), names_prefix = "SFS_bin_",
+               names_to = "SFS_bin", values_to = "Count") |>
+  group_by(cycle, SFS_bin) |>
+  summarise(Count = mean(Count), Num_seg_sites = mean(Num_seg_sites),
+            .groups = "drop") |>
+  mutate(SFS_bin = factor(SFS_bin, levels = as.character(1:10)))
+```
+
+```{r combined-figure, fig.width = 9, fig.height = 8}
+GREEN <- "#2E8B57"
+
+key_cycles_combined <- c(10000, 10010, 10100, 10110, 12000)
+sfs_key_combined <- filter(sfs_long, cycle %in% key_cycles_combined)
+
+p_top <- ggplot(panel_summary, aes(tick, rel)) +
+  geom_vline(xintercept = c(10000, 10100), linetype = "dashed",
+             colour = "grey50", linewidth = 0.4) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, group = stat),
+              fill = GREEN, alpha = 0.2) +
+  geom_line(aes(linetype = stat), colour = GREEN, linewidth = 1.2) +
+  scale_linetype_manual(values = c("Heterozygosity"    = "solid",
+                                   "Segregating sites" = "22")) +
+  scale_y_continuous(limits = c(0, NA)) +
+  scale_x_continuous(labels = function(x) x - 10000) +
+  labs(x = "Generation",
+       y = "Proportion of pre-bottleneck mean", linetype = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = c(0.05, 0.74),
+        legend.justification = c(0, 0),
+        legend.background = element_rect(fill = alpha("white", 0.7), colour = NA),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+p_bottom <- sfs_key_combined |>
+  mutate(SFS_bin2 = as.numeric(SFS_bin) / max(as.numeric(SFS_bin)) - 0.05) |>
+  ggplot(aes(SFS_bin2, Count)) +
+  geom_bar(stat = "identity", width = 0.09, fill = GREEN) +
+  facet_wrap(~ cycle, nrow = 1,
+             labeller = as_labeller(function(x) as.character(as.integer(x) - 10000))) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.2)) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(x = "Allele frequency", y = "Count") +
+  theme_minimal(base_size = 14) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+combined <- p_top / p_bottom +
+  plot_layout(heights = c(1.28, 0.75)) +
+  plot_annotation(tag_levels = "A")
+
+combined
+save_fig("Figure2_combined_diversity_sfs.pdf", combined, width = 9, height = 8)
+```
+
+## Figure 3: simplified-formula heterozygosity recovery and loss
+
+Two panels, sharing the same underlying `simp_formula()`: recovery towards
+equilibrium after a bottleneck (left) and loss across a range of bottleneck
+sizes (right).
+
+### Left panel: heterozygosity recovery, simplified formula
+
+The analytic approximation for expected heterozygosity recovering
+geometrically towards 1 after a bottleneck,
+`Het(t) = (1 - 1/(2N))^t * (Y0 - 1) + 1`, where `Y0` is the starting
+proportion (heterozygosity immediately after the bottleneck, relative to its
+equilibrium value) and `N` is the post-bottleneck population size. Not a SLiM
+output -- a closed-form curve plotted directly.
+
+```{r simp-formula-tidy}
+simp_formula <- function(N, t, Y) {
+  (1 - 1 / (2 * N))^t * (Y - 1) + 1
+}
+
+SIMP_N <- 500
+simp_t_values <- seq(0, 8 * SIMP_N, length.out = 1000)
+simp_Y_values <- c(0.1, 0.5, 0.8)
+
+simp_data <- map_dfr(simp_Y_values, function(Y) {
+  data.frame(
+    t   = simp_t_values,
+    Het = simp_formula(SIMP_N, simp_t_values, Y),
+    Y   = factor(Y)
+  )
+})
+```
+
+```{r simp-formula-plot}
+# one label per line, positioned near the start (small t) where the three
+# curves are still well separated, rather than a legend
+simp_label_t <- 100
+simp_labels <- data.frame(
+  t     = simp_label_t,
+  Y     = factor(simp_Y_values),
+  Het   = simp_formula(SIMP_N, simp_label_t, simp_Y_values),
+  # plotmath expression string: "==" renders as "=", "[0]"/"[eq]" as subscripts
+  label = paste0("H[0]/H[eq] == ", simp_Y_values)
+)
+
+Y_colours <- setNames(
+  colorRampPalette(c("red", "gold"))(length(simp_Y_values)),
+  as.character(simp_Y_values)
+)
+
+p_left <- ggplot(simp_data, aes(t, Het, colour = Y)) +
+  geom_line(linewidth = 1.2) +
+  geom_text(data = simp_labels, aes(label = label), parse = TRUE,
+            colour = "black", size = 4, hjust = 0, nudge_x = 60,
+            show.legend = FALSE) +
+  scale_colour_manual(values = Y_colours) +
+  labs(x = "Generations", y = expression(H[t] / H[eq])) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+        # both axes bumped to 16pt together, so x and y match within this
+        # panel; deliberately larger than Figure 2/4a's 14pt titles to
+        # compensate for plotmath subscripts ("t"/"eq") rendering lighter
+        # than plain text like Figure 2's "Count"
+        axis.title = element_text(size = 16))
+
+p_left
+```
+
+### Right panel: heterozygosity loss across bottleneck sizes
+
+Same underlying `simp_formula()` as the left panel, applied to a different
+scenario: a population at mutation-drift equilibrium for size `M = 500` drops
+to a bottleneck size `N`, and heterozygosity decays from the old equilibrium
+towards the new (lower) one over the first 100 generations.
+
+That scenario can also be written directly from `u` and the mutation-drift
+equilibrium `Heq(x) = 4xu / (1 + 4xu)`:
+`formula(N, t, u, M) = [(1 - 1/(2N))^t * (Heq(M) - Heq(N)) + Heq(N)] / Heq(M)`.
+That is algebraically the same curve as `simp_formula()`, just parameterised
+differently: `simp_formula(N, t, Y)` decays *from* `Y` *to* its own
+equilibrium of 1, whereas this scenario decays *from* 1 (old equilibrium,
+`Heq(M)`) *to* something below 1 (new equilibrium, `Heq(N)/Heq(M)`) -- the
+reverse direction. Setting `Y0 = Heq(M) / Heq(N)` and dividing the
+`simp_formula()` output by that same `Y0` turns one into the other exactly:
+`simp_formula(N, t, Y0) / Y0 = rate^t * (1 - 1/Y0) + 1/Y0`, identical to
+`formula(N, t, u, M)` after expanding it out -- so this reuses
+`simp_formula()` as-is rather than a second implementation, with `Heq()`
+doing only the small job of converting a starting/target equilibrium ratio
+into the `Y` that `simp_formula()` expects.
+
+```{r het-loss-tidy}
+# mutation-drift equilibrium heterozygosity for population size N
+eq_het <- function(N, u) (4 * N * u) / (1 + 4 * N * u)
+
+HET_LOSS_U        <- 1e-8
+HET_LOSS_M        <- 500
+het_loss_N_values <- c(2, 5, 10, 20, 30, 50, 100, 200, 500)
+het_loss_t_values <- seq(0, 100, length.out = 1000)
+
+het_loss_data <- map_dfr(het_loss_N_values, function(N) {
+  Y0 <- eq_het(HET_LOSS_M, HET_LOSS_U) / eq_het(N, HET_LOSS_U)
+  data.frame(
+    t   = het_loss_t_values,
+    Het = simp_formula(N, het_loss_t_values, Y0) / Y0,
+    N   = factor(N, levels = het_loss_N_values)
+  )
+})
+
+# One label per line, placed where that line actually crosses the diagonal
+# running from the plot's bottom-left corner (t_min, 0) to its top-right
+# corner (t_max, y_max) -- an imaginary reference line, not a curve -- found
+# by solving Het_N(t) == diagonal(t) numerically for each N. Fast-decaying
+# (small N) curves drop below the diagonal early, slow ones cross late, so
+# solving this puts small-N labels bottom-left and large-N labels top-right
+# without decoupling the label from its own line.
+diag_t_min <- min(het_loss_t_values)
+diag_t_max <- max(het_loss_t_values)
+diag_y_min <- 0
+diag_y_max <- max(het_loss_data$Het)
+
+diagonal_y <- function(t) {
+  diag_y_min + (diag_y_max - diag_y_min) *
+    (t - diag_t_min) / (diag_t_max - diag_t_min)
+}
+
+het_loss_labels <- map_dfr(het_loss_N_values, function(N) {
+  Y0 <- eq_het(HET_LOSS_M, HET_LOSS_U) / eq_het(N, HET_LOSS_U)
+  curve_het <- function(t) simp_formula(N, t, Y0) / Y0
+  root <- uniroot(function(t) curve_het(t) - diagonal_y(t),
+                   interval = c(diag_t_min, diag_t_max),
+                   extendInt = "yes")$root
+  data.frame(N = N, t = root, Het = curve_het(root))
+}) |>
+  mutate(N = factor(N, levels = het_loss_N_values))
+```
+
+```{r het-loss-plot}
+N_colours <- setNames(
+  colorRampPalette(c("red", "gold"))(length(het_loss_N_values)),
+  as.character(het_loss_N_values)
+)
+
+p_right <- ggplot(het_loss_data, aes(t, Het, colour = N, group = N)) +
+  geom_line(linewidth = 1.2) +
+  geom_text(data = het_loss_labels, aes(label = paste0("Ne=", N)),
+            colour = "black", size = 4, nudge_y = 0.03,
+            show.legend = FALSE) +
+  scale_colour_manual(values = N_colours, name = "Bottleneck Ne") +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Generations",
+       y = expression(H[t] / H[eq])) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+        axis.title = element_text(size = 16))
+
+p_right
+```
+
+### Combined
+
+```{r figure3-combined, fig.width = 14, fig.height = 6}
+figure3 <- p_left | p_right
+figure3 <- figure3 + plot_annotation(tag_levels = "A")
+
+figure3
+save_fig("Figure3_simp_formula_recovery_and_loss.pdf", figure3, width = 14, height = 6)
+```
+
+## Figure 4: state-level site counts and sampling coverage
+
+Built from real koala allele-frequency/VEP data, split by
+state (VIC/NSW/QLD) and by variant consequence class. This section reads its
+twelve raw input tables from a `data/` folder next to this file. **These raw
+tables are not distributed with this script.** They were made available
+previously by:
+
+> Ahrens, C. W., et al. (2026). Escaping bottlenecks: The demographic path to
+> genetic recovery in koalas (*Phascolarctos cinereus*). *Science*.
+> https://doi.org/10.1126/science.adz1430
+
+Required files, all expected in `data/`:
+
+- `kkvep_rare01_all_R.txt`, `kkvep_rare05_all_R.txt`, `kkvep_comm05_all_R.txt`
+  (VEP consequence calls, one file per frequency class)
+- `AF_qld_rare01.txt`, `AF_nsw_rare01.txt`, `AF_vic_rare01.txt`
+- `AF_qld_rare05.txt`, `AF_nsw_rare05.txt`, `AF_vic_rare05.txt`
+- `AF_qld_comm05.txt`, `AF_nsw_comm05.txt`, `AF_vic_comm05.txt`
+  (per-state allele-frequency tables, one triplet per frequency class)
+
+Only the columns that feed the final figure are kept: each state's
+allele-frequency table is joined against its VEP consequence calls on
+`chr:base`, consequences are collapsed into four categories (LOF, missense,
+regulatory, intergenic), and site counts (segregating vs fixed, per state,
+per class) are summarised into `site_counts_comb`.
+
+```{r fig4-data-prep}
+FIG5_DIR <- file.path(PROJ_DIR, "data")
+stopifnot(dir.exists(FIG5_DIR))
+
+read_af_class <- function(vep_file, qld_file, nsw_file, vic_file, freq_category) {
+  vep <- read.table(file.path(FIG5_DIR, vep_file), header = TRUE)
+  vep_short <- vep[, c(2, 7)]
+  loc <- data.frame(do.call("rbind",
+    strsplit(as.character(vep_short$Location), ":", fixed = TRUE)))
+  vep_short2 <- cbind(loc, vep_short$Consequence)
+  colnames(vep_short2) <- c("chr", "base", "consequence")
+  vep_short2$base <- as.integer(vep_short2$base)
+
+  qld <- read.table(file.path(FIG5_DIR, qld_file), header = FALSE)
+  nsw <- read.table(file.path(FIG5_DIR, nsw_file), header = FALSE)
+  vic <- read.table(file.path(FIG5_DIR, vic_file), header = FALSE)
+  colnames(qld) <- c("chr", "base", "AF_qld")
+  colnames(nsw) <- c("chr", "base", "AF_nsw")
+  colnames(vic) <- c("chr", "base", "AF_vic")
+
+  all_af <- qld |>
+    left_join(nsw, by = c("chr", "base")) |>
+    left_join(vic, by = c("chr", "base")) |>
+    left_join(vep_short2, by = c("chr", "base"))
+  all_af$freq_category <- freq_category
+  all_af
+}
+
+all_af.all <- bind_rows(
+  read_af_class("kkvep_rare01_all_R.txt", "AF_qld_rare01.txt",
+                "AF_nsw_rare01.txt", "AF_vic_rare01.txt", "rare_01"),
+  read_af_class("kkvep_rare05_all_R.txt", "AF_qld_rare05.txt",
+                "AF_nsw_rare05.txt", "AF_vic_rare05.txt", "low_freq_r05"),
+  read_af_class("kkvep_comm05_all_R.txt", "AF_qld_comm05.txt",
+                "AF_nsw_comm05.txt", "AF_vic_comm05.txt", "common_c05")
+)
+
+all_af.all$cons_category <- with(all_af.all,
+  ifelse(consequence == "intergenic_variant", "inter",
+  ifelse(consequence == "missense_variant", "miss",
+  ifelse(consequence %in% c(
+           "splice_acceptor_variant", "splice_donor_variant", "stop_gained",
+           "splice_region_variant,5_prime_UTR_variant",
+           "splice_region_variant,splice_polypyrimidine_tract_variant,intron_variant",
+           "stop_lost,splice_region_variant",
+           "splice_region_variant,3_prime_UTR_variant",
+           "splice_region_variant,intron_variant",
+           "start_lost,splice_region_variant",
+           "stop_gained,splice_region_variant"), "lof",
+  ifelse(consequence %in% c("upstream_gene_variant", "downstream_gene_variant"),
+         "reg", NA)))))
+
+all_af_long <- all_af.all |>
+  select(chr, base, cons_category, AF_qld, AF_nsw, AF_vic, freq_category) |>
+  pivot_longer(cols = c(AF_qld, AF_nsw, AF_vic),
+               names_to = "state", values_to = "AF") |>
+  mutate(state = recode(state, "AF_qld" = "QLD", "AF_nsw" = "NSW", "AF_vic" = "VIC"))
+
+# named vector of state sample sizes -- deliberately distinct from the
+# unrelated `sample_sizes` (a plain 1:300 sequence) used below for the
+# sampling-coverage curves, so the two never collide
+state_sample_sizes <- c("VIC" = 72, "NSW" = 242, "QLD" = 104)
+
+site_counts_comb <- all_af_long |>
+  filter(!is.na(cons_category)) |>
+  group_by(freq_category, state, cons_category) |>
+  summarise(
+    n_AF_gt0  = sum(AF > 0, na.rm = TRUE),
+    n_AF_poly = sum(AF > 0 & AF < 1, na.rm = TRUE),
+    n_AF_eq1  = sum(AF == 1, na.rm = TRUE),
+    n_AF_eq0  = sum(AF == 0, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    n_AF_gt0_psample  = n_AF_gt0  / state_sample_sizes[state],
+    n_AF_poly_psample = n_AF_poly / state_sample_sizes[state],
+    n_AF_eq1_psample  = n_AF_eq1  / state_sample_sizes[state],
+    n_AF_eq0_psample  = n_AF_eq0  / state_sample_sizes[state],
+    eq1overgt0        = n_AF_eq1 / n_AF_gt0,
+    state = factor(state, levels = c("QLD", "NSW", "VIC"))
+  ) |>
+  arrange(freq_category, state, cons_category)
+```
+
+```{r fig4-tidy}
+# Axis numbers: plain integers with comma separators, padded to a fixed
+# character width so that, once rotated, every panel's axis text reserves
+# the same vertical space regardless of digit count.
+count_labels <- function(x) {
+  formatC(scales::comma(x), width = 12)
+}
+
+sites_split <- site_counts_comb |>
+  select(freq_category, state, cons_category, n_AF_poly_psample, n_AF_eq1_psample) |>
+  pivot_longer(cols = c(n_AF_poly_psample, n_AF_eq1_psample),
+               names_to = "site_type", values_to = "n_psample") |>
+  mutate(
+    site_type = recode(site_type,
+                        n_AF_poly_psample = "Segregating",
+                        n_AF_eq1_psample  = "Fixed"),
+    site_type = factor(site_type, levels = c("Fixed", "Segregating")),
+    cons_category = factor(cons_category, levels = c("lof", "miss", "reg", "inter")),
+    freq_category = factor(freq_category,
+                           levels = c("rare_01", "low_freq_r05", "common_c05"))
+  )
+
+poly_only <- site_counts_comb |>
+  select(freq_category, state, cons_category, n_AF_poly) |>
+  mutate(
+    cons_category = factor(cons_category, levels = c("lof", "miss", "reg", "inter")),
+    freq_category = factor(freq_category,
+                           levels = c("rare_01", "low_freq_r05", "common_c05"))
+  )
+```
+
+```{r fig4-bands}
+# % of SNPs observed for different allele frequencies, across sample sizes,
+# shaded by the three MAF classes used throughout this figure.
+AFs <- c(0.5, 0.05, 0.01, 0.001)
+sample_sizes <- 1:300
+
+df_pct <- expand.grid(AF = AFs, n = sample_sizes) |>
+  mutate(percent_sampled = (1 - (1 - AF)^(2 * n)) * 100)
+
+df_pct_wide <- df_pct |>
+  select(n, AF, percent_sampled) |>
+  pivot_wider(names_from = AF, values_from = percent_sampled, names_prefix = "AF_")
+
+ribbon_df <- bind_rows(
+  df_pct_wide |> transmute(n, ymin = AF_0.05, ymax = 100,     category = "Common (MAF > 0.05)"),
+  df_pct_wide |> transmute(n, ymin = AF_0.01, ymax = AF_0.05, category = "Low frequency (0.01 < MAF < 0.05)"),
+  df_pct_wide |> transmute(n, ymin = 0,       ymax = AF_0.01, category = "Rare (MAF < 0.01)")
+) |>
+  mutate(category = factor(category, levels = c(
+    "Common (MAF > 0.05)",
+    "Low frequency (0.01 < MAF < 0.05)",
+    "Rare (MAF < 0.01)"
+  )))
+
+# VIC = 72, QLD = 104, NSW = 242 -- same state sample sizes as state_sample_sizes
+vline_labels <- data.frame(x = c(72, 104, 242), label = c("VIC", "QLD", "NSW"))
+
+p_bands <- ggplot() +
+  geom_ribbon(data = ribbon_df, aes(x = n, ymin = ymin, ymax = ymax, fill = category), alpha = 0.6) +
+  geom_line(
+    data = df_pct |> filter(AF %in% c(0.05, 0.01)),
+    aes(x = n, y = percent_sampled, group = as.factor(AF)),
+    colour = "black", linewidth = 0.4
+  ) +
+  geom_segment(
+    data = vline_labels,
+    aes(x = x, xend = x, y = 0, yend = 102),
+    inherit.aes = FALSE, linetype = "dashed", colour = "grey50", linewidth = 0.4
+  ) +
+  geom_text(
+    data = vline_labels,
+    aes(x = x, y = 105, label = label),
+    inherit.aes = FALSE, hjust = 0.5, vjust = 1, fontface = "bold", size = 4
+  ) +
+  scale_fill_manual(values = c(
+    "Common (MAF > 0.05)" = "cornflowerblue",
+    "Low frequency (0.01 < MAF < 0.05)" = "goldenrod",
+    "Rare (MAF < 0.01)" = "tomato"
+  ), name = "Allele frequency class") +
+  guides(fill = guide_legend(ncol = 1, direction = "vertical")) +
+  labs(x = "Samples", y = "% of SNPs observed") +
+  coord_cartesian(ylim = c(0, 102)) +
+  force_panelsizes(rows = unit(8, "cm")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+    axis.text.x = element_text(margin = margin(t = 1)),
+    axis.title.x = element_text(margin = margin(t = 1)),
+    axis.ticks.length = unit(1, "pt")
+  )
+
+p_bands
+```
+
+```{r fig4-stacked-rot}
+# States on the x-axis, site counts on the y-axis.
+p_stacked_rot <- ggplot(sites_split, aes(x = state, y = n_psample, fill = state, alpha = site_type)) +
+  geom_bar(stat = "identity", position = "stack", width = 1) +
+  facet_grid2(
+    rows = vars(cons_category), cols = vars(freq_category),
+    scales = "free_y", independent = "y",
+    labeller = labeller(
+      freq_category = c(
+        common_c05 = "Common", low_freq_r05 = "Low\nfrequency", rare_01 = "Rare"
+      ),
+      cons_category = c(
+        lof = "LOF", miss = "Missense", reg = "Regulatory", inter = "Intergenic"
+      )
+    )
+  ) +
+  force_panelsizes(rows = unit(3, "cm"), cols = unit(2.5, "cm")) +
+  scale_x_discrete(limits = c("VIC", "NSW", "QLD")) +
+  # no bottom expansion, so the bars sit flush against the panel border
+  # instead of leaving a gap below zero; top keeps its usual 5% headroom
+  scale_y_continuous(labels = count_labels, expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = c(QLD = "tomato", NSW = "goldenrod", VIC = "cornflowerblue")) +
+  scale_alpha_manual(values = c("Fixed" = 0.4, "Segregating" = 1), name = "Site type") +
+  guides(fill = "none", alpha = guide_legend(reverse = TRUE)) +
+  labs(title = NULL, y = "Derived sites divided by sample size", x = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+    panel.grid = element_blank(),
+    panel.spacing = unit(0.15, "cm"),
+    strip.placement = "outside",
+    strip.switch.pad.grid = grid::unit(0.1, "cm"),
+    strip.background = element_blank(),
+    strip.text.y = element_text(face = "bold", size = 11),
+    strip.text.x = element_text(face = "bold", size = 11),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 8, margin = margin(r = 0)),
+    axis.ticks.length = unit(1, "pt"),
+    axis.text.x = element_text(size = 8),
+    axis.title.y = element_text(size = 12, margin = margin(r = 0))
+  )
+
+p_stacked_rot
+```
+
+```{r fig4-poly-rot}
+p_poly_rot <- ggplot(poly_only, aes(x = state, y = n_AF_poly, fill = state)) +
+  geom_bar(stat = "identity", width = 1) +
+  facet_grid2(
+    rows = vars(cons_category), cols = vars(freq_category),
+    scales = "free_y", independent = "y",
+    labeller = labeller(
+      freq_category = c(
+        common_c05 = "Common", low_freq_r05 = "Low\nfrequency", rare_01 = "Rare"
+      ),
+      cons_category = c(
+        lof = "LOF", miss = "Missense", reg = "Regulatory", inter = "Intergenic"
+      )
+    )
+  ) +
+  force_panelsizes(rows = unit(3, "cm"), cols = unit(2.5, "cm")) +
+  scale_x_discrete(limits = c("VIC", "NSW", "QLD")) +
+  scale_y_continuous(labels = count_labels, expand = expansion(mult = c(0, 0.1))) +
+  scale_fill_manual(values = c(QLD = "tomato", NSW = "goldenrod", VIC = "cornflowerblue")) +
+  guides(fill = "none") +
+  labs(title = NULL, y = "Segregating sites", x = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+    panel.grid = element_blank(),
+    panel.spacing = unit(0.15, "cm"),
+    strip.placement = "outside",
+    strip.switch.pad.grid = grid::unit(0.1, "cm"),
+    strip.background = element_blank(),
+    strip.text.y = element_text(face = "bold", size = 11),
+    strip.text.x = element_text(face = "bold", size = 11),
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    axis.text.y = element_text(size = 8, margin = margin(r = 0)),
+    axis.ticks.length = unit(1, "pt"),
+    axis.text.x = element_text(size = 8),
+    axis.title.y = element_text(size = 12, margin = margin(r = 0))
+  )
+
+p_poly_rot
+```
+
+```{r fig4-combined, fig.width = 16, fig.height = 8}
+# p_bands is a single simple panel, while p_stacked_rot/p_poly_rot are each a
+# 4x3 grid of facets with their own per-row axis text -- free() exempts
+# p_bands' panel from being cross-aligned with those, while keeping its own
+# axis titles/labels intact. Each plot keeps its own legend directly beneath
+# itself rather than collecting them into one.
+combined_plot_rot <- (free(p_bands) + p_stacked_rot + p_poly_rot) +
+  plot_layout(nrow = 1) +
+  plot_annotation(tag_levels = "a") &
+  theme(legend.position = "bottom")
+
+combined_plot_rot
+save_fig("Figure4_combined_plot_rot.pdf", combined_plot_rot, width = 16, height = 8)
+```
